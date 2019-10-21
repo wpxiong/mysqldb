@@ -4,6 +4,8 @@ package mysqldb
 import (
 	"context"
 	"database/sql"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -12,14 +14,15 @@ type DBProxy struct {
 	slave             []*DB
 	DbOperator        DBOperate
 	dbReady           bool
-	slaveCount        int
+	slaveCount        int32
 	scanSeconds       int
 	dbcollectioncheck chan int
-	activeCount       int
-	roundRobin        int
+	activeCount       int32
+	roundRobin        int32
+	resizeMutex       *sync.Mutex
 }
 
-var UINT_MAX int = ^int(0)
+var INT_MAX int32 = ^int32(0)
 
 func init() {
 	InitLog()
@@ -33,6 +36,7 @@ func CreateDBProxy() *DBProxy {
 		scanSeconds: 5,
 		roundRobin:  0,
 		slave:       make([]*DB, 10),
+		resizeMutex: &sync.Mutex{},
 	}
 	dbProxy.dbcollectioncheck = dbProxy.startListener()
 	return dbProxy
@@ -41,7 +45,7 @@ func CreateDBProxy() *DBProxy {
 func (dbProxy *DBProxy) CloseCollection() error {
 	dbProxy.dbcollectioncheck <- 1
 	var errorCode error = nil
-	for i := 0; i < dbProxy.slaveCount; i++ {
+	for i := 0; i < int(atomic.LoadInt32(&dbProxy.slaveCount)); i++ {
 		if err := dbProxy.slave[i].CloseCollection(); err != nil {
 			errorCode = err
 		}
@@ -65,8 +69,8 @@ func (dbProxy *DBProxy) checkDBCollection() {
 		dbProxy.dbReady = true
 	}
 
-	activeCount := 0
-	for i := 0; i < dbProxy.slaveCount; i++ {
+	var activeCount int32 = 0
+	for i := 0; i < int(atomic.LoadInt32(&dbProxy.slaveCount)); i++ {
 		if dbProxy.slave[i].Ping() == nil {
 			activeCount = activeCount + 1
 		}
@@ -106,54 +110,56 @@ func (dbProxy *DBProxy) AddSlaveDB(DbName string, DbConnectionUrl string, DbUser
 }
 
 func (dbProxy *DBProxy) addToSlaveDB(newDB *DB) {
-	if dbProxy.slaveCount >= len(dbProxy.slave) {
+	if int(atomic.LoadInt32(&dbProxy.slaveCount)) >= len(dbProxy.slave) {
 		dbProxy.resizeSlaveDB()
 	}
-	dbProxy.slave[dbProxy.slaveCount] = newDB
-	dbProxy.slaveCount = dbProxy.slaveCount + 1
+	dbProxy.slave[int(atomic.LoadInt32(&dbProxy.slaveCount))] = newDB
+	atomic.AddInt32(&dbProxy.slaveCount, 1)
 }
 
 func (dbProxy *DBProxy) resizeSlaveDB() {
+	dbProxy.resizeMutex.Lock()
 	newArr := make([]*DB, len(dbProxy.slave)*2)
 	for i := 0; i < len(dbProxy.slave); i++ {
 		newArr[i] = dbProxy.slave[i]
 	}
 	dbProxy.slave = newArr
+	dbProxy.resizeMutex.Unlock()
 }
 
 func (dbProxy *DBProxy) SetConnMaxLifetime(d time.Duration) {
 	dbProxy.master.SetConnMaxLifetime(d)
-	for i := 0; i < dbProxy.slaveCount; i++ {
+	for i := 0; i < int(atomic.LoadInt32(&dbProxy.slaveCount)); i++ {
 		dbProxy.slave[i].SetConnMaxLifetime(d)
 	}
 }
 
 func (dbProxy *DBProxy) SetMaxIdleConns(n int) {
 	dbProxy.master.SetMaxIdleConns(n)
-	for i := 0; i < dbProxy.slaveCount; i++ {
+	for i := 0; i < int(atomic.LoadInt32(&dbProxy.slaveCount)); i++ {
 		dbProxy.slave[i].SetMaxIdleConns(n)
 	}
 }
 
 func (dbProxy *DBProxy) SetMaxOpenConns(n int) {
 	dbProxy.master.SetMaxOpenConns(n)
-	for i := 0; i < dbProxy.slaveCount; i++ {
+	for i := 0; i < int(atomic.LoadInt32(&dbProxy.slaveCount)); i++ {
 		dbProxy.slave[i].SetMaxOpenConns(n)
 	}
 }
 
 func (dbProxy *DBProxy) getRoundRobin() *DB {
-	if dbProxy.activeCount == 0 {
+	if atomic.LoadInt32(&dbProxy.activeCount) == 0 {
 		return dbProxy.master
 	}
-	if dbProxy.roundRobin == UINT_MAX {
+	if atomic.LoadInt32(&dbProxy.roundRobin) == INT_MAX {
 		dbProxy.roundRobin = 0
 	}
 	dbProxy.roundRobin++
-	index := dbProxy.roundRobin % dbProxy.activeCount
+	index := atomic.LoadInt32(&dbProxy.roundRobin) % atomic.LoadInt32(&dbProxy.activeCount)
 	var selectDB *DB = nil
-	j := 0
-	for i := 0; i < dbProxy.slaveCount; i++ {
+	var j int32 = 0
+	for i := 0; i < int(atomic.LoadInt32(&dbProxy.slaveCount)); i++ {
 		if dbProxy.slave[i].dbReady {
 			j++
 			selectDB = dbProxy.slave[i]
