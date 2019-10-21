@@ -20,6 +20,7 @@ type DBProxy struct {
 	activeCount       int32
 	roundRobin        int32
 	resizeMutex       *sync.Mutex
+	roundRobinMutex   *sync.Mutex
 }
 
 var INT_MAX int32 = ^int32(0)
@@ -30,13 +31,14 @@ func init() {
 
 func CreateDBProxy() *DBProxy {
 	var dbProxy *DBProxy = &DBProxy{
-		slaveCount:  0,
-		activeCount: 0,
-		dbReady:     false,
-		scanSeconds: 5,
-		roundRobin:  0,
-		slave:       make([]*DB, 10),
-		resizeMutex: &sync.Mutex{},
+		slaveCount:      0,
+		activeCount:     0,
+		dbReady:         false,
+		scanSeconds:     5,
+		roundRobin:      0,
+		slave:           make([]*DB, 10),
+		resizeMutex:     &sync.Mutex{},
+		roundRobinMutex: &sync.Mutex{},
 	}
 	dbProxy.dbcollectioncheck = dbProxy.startListener()
 	return dbProxy
@@ -152,10 +154,15 @@ func (dbProxy *DBProxy) getRoundRobin() *DB {
 	if atomic.LoadInt32(&dbProxy.activeCount) == 0 {
 		return dbProxy.master
 	}
-	if atomic.LoadInt32(&dbProxy.roundRobin) == INT_MAX {
+
+	dbProxy.roundRobinMutex.Lock()
+	if atomic.LoadInt32(&dbProxy.roundRobin) < INT_MAX {
 		dbProxy.roundRobin = 0
 	}
-	dbProxy.roundRobin++
+	dbProxy.roundRobinMutex.Unlock()
+
+	atomic.AddInt32(&dbProxy.roundRobin, 1)
+
 	index := atomic.LoadInt32(&dbProxy.roundRobin) % atomic.LoadInt32(&dbProxy.activeCount)
 	var selectDB *DB = nil
 	var j int32 = 0
